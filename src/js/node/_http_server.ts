@@ -20,10 +20,12 @@ const {
 const {
   ConnResetException,
   ErrnoException,
+  ExceptionWithHostPort,
   hasObserver,
   startPerf,
   stopPerf,
   kInternalSendOptions,
+  kClusterOwner,
   isStoppedModuleGraphRunning,
 } = require("internal/shared");
 const kServerResponseStatistics = Symbol("ServerResponseStatistics");
@@ -509,6 +511,20 @@ Server.prototype.unref = function () {
   return this;
 };
 
+// The handle that the cluster primary shared for `listen({ fd })` in a worker.
+const kClusterHandle = Symbol("kClusterHandle");
+// listen() and close() in a worker change it, so the worker drops a late answer of the primary.
+const kClusterListeningId = Symbol("kClusterListeningId");
+
+// Tells the primary that this worker no longer listens on the handle.
+function releaseClusterHandle(server) {
+  const handle = server[kClusterHandle];
+  if (!handle) return;
+  server[kClusterHandle] = undefined;
+  handle[kClusterOwner] = null;
+  handle.close();
+}
+
 Server.prototype.closeAllConnections = function () {
   http1Fallback?.closeAllHttp1Connections(this);
   // Like Node, the listener and the sockets handed to 'connect' and 'upgrade' listeners stay.
@@ -547,6 +563,7 @@ Server.prototype.closeIdleConnections = function () {
 };
 
 Server.prototype.close = function (optionalCallback?) {
+  if (!isPrimary) this[kClusterListeningId] = (this[kClusterListeningId] || 0) + 1;
   const server = this[serverSymbol];
   // Node.js's httpServerPreClose clears the connections-checking interval
   // even when the server was never listening.
@@ -568,6 +585,7 @@ Server.prototype.close = function (optionalCallback?) {
   if (generation) generation.drainedAtClose = open === swept;
   // stop() queues the task that emits 'close', which holds the loop one more turn, as node's uv_close() does.
   server.stop();
+  if (!isPrimary) releaseClusterHandle(this);
   return this;
 };
 
@@ -656,6 +674,8 @@ Server.prototype.listen = function () {
   }
 
   if (fd !== undefined && this[serverSymbol]) throw $ERR_SERVER_ALREADY_LISTEN();
+  // As in node, a listen() makes the answer of the primary to an earlier listen({ fd }) invalid.
+  if (!isPrimary) this[kClusterListeningId] = (this[kClusterListeningId] || 0) + 1;
 
   // Bun defaults to port 3000.
   // Node defaults to port 0.
@@ -682,7 +702,10 @@ Server.prototype.listen = function () {
     if (fd !== undefined) {
       if (!NumberIsInteger(fd) || fd > 0x7fffffff) throw listenFdError("EINVAL");
       // In node the number names a descriptor of the primary. A process with no channel has no primary.
-      if (!isPrimary && process.connected) throw new ErrnoException(process.binding("uv").UV_ENOTSUP, "listen");
+      if (!isPrimary && process.connected) {
+        listenFdInWorker(server, tls, fd);
+        return this;
+      }
       try {
         server[kRealListen](tls, undefined, undefined, undefined, false, fd);
       } catch (err: any) {
@@ -723,6 +746,37 @@ Server.prototype.listen = function () {
 
   return this;
 };
+
+// The number names a descriptor of the primary: https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2055-L2102
+function listenFdInWorker(server, tls, fd: number) {
+  if (cluster === undefined) cluster = require("node:cluster");
+  const listeningId = server[kClusterListeningId];
+  // Each worker accepts on the shared socket. An http server cannot take connections that the primary accepted.
+  const query = { address: null, port: null, addressType: null, fd, flags: 0, sharedOnly: true };
+  cluster._getServer(server, query, function listenOnPrimaryHandle(errno, handle, reply) {
+    if (listeningId !== server[kClusterListeningId]) {
+      handle?.close();
+      return;
+    }
+    const sharedFd = handle?.sharedFd;
+    if (errno || typeof sharedFd !== "number") {
+      handle?.close();
+      const error = new ExceptionWithHostPort(errno || process.binding("uv").UV_EINVAL, "bind", null as any);
+      if (typeof reply?.bunHint === "string") error.message += `\n  note: ${reply.bunHint}`;
+      server.emit("error", error);
+      return;
+    }
+    server[kClusterHandle] = handle;
+    handle[kClusterOwner] = server;
+    try {
+      server[kRealListen](tls, undefined, undefined, undefined, false, sharedFd);
+      handle.adopted = true;
+    } catch (err: any) {
+      releaseClusterHandle(server);
+      server.emit("error", (err?.syscall === "listen" && listenFdError(err.code)) || err);
+    }
+  });
+}
 
 Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort, fd?: number) {
   {
