@@ -12,7 +12,9 @@ using namespace JSC;
 class JSFFICStringConstructor final : public JSC::InternalFunction {
 public:
     using Base = JSC::InternalFunction;
-    static constexpr unsigned StructureFlags = Base::StructureFlags;
+    // `new CString(ptr)` evaluates to a string primitive, which no constructor may return. So CString is not a
+    // constructor to anything that asks first (Array.of, Array.from, species, Reflect.construct, bind, Proxy, extends).
+    static constexpr unsigned StructureFlags = Base::StructureFlags | JSC::ReportsNoConstructData;
     static constexpr JSC::DestructionMode needsDestruction = JSC::DoesNotNeedDestruction;
 
     DECLARE_INFO;
