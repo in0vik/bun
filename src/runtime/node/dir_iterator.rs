@@ -6,34 +6,34 @@
 
 #![warn(unused_must_use)]
 
+#[cfg(windows)]
 use core::mem::offset_of;
 
 use bun_core::RawSlice;
-#[cfg(not(target_os = "macos"))]
-use bun_sys::Tag;
-use bun_sys::{self as sys, Fd};
+#[cfg(unix)]
+use bun_sys::dirent;
+use bun_sys::{self as sys, Fd, Tag};
 
 // `Entry.Kind` is `bun_core::FileKind`, re-exported here as
 // `bun_sys::EntryKind` (and as `crate::node::types::DirentKind`).
 use bun_sys::EntryKind;
 
 pub(crate) struct IteratorResult {
-    /// `RawSlice` invariant: borrows the iterator's `getdents` buffer
+    /// `RawSlice` invariant: borrows the iterator's buffer
     /// (streaming-iterator contract — invalidated on next `next()` call).
-    /// The kernel writes `d_name` NUL-terminated, so the backing has a NUL at
-    /// `[name.len()]` (see `name_assume_z`).
+    /// The backing has a NUL at `[name.len()]` (see `name_assume_z`). On POSIX
+    /// `dirent::parse` checked that it lies inside the record. On Windows
+    /// `from_w_path` wrote it.
     pub name: RawSlice<u8>,
     pub(crate) kind: EntryKind,
 }
 
 impl IteratorResult {
-    /// The entry name as a NUL-terminated `&ZStr` — the POSIX `d_name` is always
-    /// NUL-terminated in the `getdents` buffer.
+    /// The entry name as a NUL-terminated `&ZStr`.
     #[inline]
     pub(crate) fn name_assume_z(&self) -> &bun_core::ZStr {
         let s = self.name.slice();
-        // SAFETY: `d_name` is NUL-terminated by the kernel; `name` points at it
-        // with len excluding the NUL, so `[len] == 0`.
+        // SAFETY: `[len] == 0`, see `name`.
         unsafe { bun_core::ZStr::from_raw(s.as_ptr(), s.len()) }
     }
 }
@@ -84,13 +84,9 @@ impl<const B: bool> WrappedSelect<B> for () {}
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
-    use core::ptr::addr_of;
 
-    /// Darwin's `struct dirent` (64-bit ino) leads with `d_ino: u64` (align 8);
-    /// a bare `[u8; N]` field has alignment 1, so wrap it to force 8-byte
-    /// alignment for the *first* record. Subsequent records are only 4-byte
-    /// aligned by the kernel (`d_reclen` rounds to 4), so reads still go
-    /// through `read_unaligned`.
+    /// 8-byte alignment matches Darwin's `struct dirent`. `dirent::parse`
+    /// reads the records as bytes, so no read depends on it.
     #[repr(C, align(8))]
     pub(crate) struct DirentBuf(pub [u8; 8192]);
 
@@ -112,7 +108,9 @@ mod platform {
 
         fn next_darwin(&mut self) -> Result {
             'start_over: loop {
-                if self.index >= self.end_index {
+                // The refill keeps `end_index` inside the buffer.
+                let filled = self.buf.0.get(..self.end_index).unwrap_or(&self.buf.0);
+                if self.index >= filled.len() {
                     if self.received_eof {
                         return Ok(None);
                     }
@@ -151,40 +149,17 @@ mod platform {
                             .expect("infallible: size matches"),
                     );
                     self.received_eof = self.end_index <= (self.buf.0.len() - 4) && eof_flag == 1;
-                }
-                // Records are variable-length; the kernel rounds `d_reclen` to
-                // 4 bytes, not 8, so subsequent entries are NOT aligned to
-                // `align_of::<libc::dirent>() == 8`. Additionally each on-disk
-                // record is shorter than `size_of::<libc::dirent>()` (1048),
-                // so forming a `&libc::dirent` would assert validity past the
-                // record / buffer end. Never materialize a reference — read
-                // each field through the raw pointer.
-                // SAFETY: self.index < self.end_index <= buf.len(); kernel
-                // wrote a valid (possibly 4-aligned) dirent record here.
-                let entry = unsafe { self.buf.0.as_ptr().add(self.index).cast::<libc::dirent>() };
-                // SAFETY: `entry` points at a valid (possibly unaligned)
-                // dirent; addr_of! avoids creating intermediate references.
-                let d_reclen: u16 = unsafe { addr_of!((*entry).d_reclen).read_unaligned() };
-                // SAFETY: same `entry` record as above.
-                let d_namlen: u16 = unsafe { addr_of!((*entry).d_namlen).read_unaligned() };
-                // SAFETY: same `entry` record as above.
-                let d_ino: u64 = unsafe { addr_of!((*entry).d_ino).read_unaligned() };
-                // SAFETY: same `entry` record as above.
-                let d_type: u8 = unsafe { addr_of!((*entry).d_type).read_unaligned() };
-                let entry_idx = self.index;
-                self.index += d_reclen as usize;
-
-                // d_name is `d_namlen` initialized bytes at a fixed offset within
-                // the record; slice it directly from `buf` (bounds-checked) instead
-                // of going through the raw `*const dirent`.
-                let name_off = entry_idx + offset_of!(libc::dirent, d_name);
-                let name = &self.buf.0[name_off..name_off + d_namlen as usize];
-
-                if name == b"." || name == b".." || d_ino == 0 {
                     continue 'start_over;
                 }
+                let Some(record) = dirent::parse::<dirent::Native>(filled, self.index) else {
+                    return Err(dirent::malformed(Tag::getdirentries64));
+                };
+                self.index = record.next;
+                let Some(entry) = record.entry else {
+                    continue 'start_over;
+                };
 
-                let entry_kind = match d_type {
+                let entry_kind = match entry.d_type {
                     libc::DT_BLK => EntryKind::BlockDevice,
                     libc::DT_CHR => EntryKind::CharacterDevice,
                     libc::DT_DIR => EntryKind::Directory,
@@ -197,7 +172,7 @@ mod platform {
                     _ => EntryKind::Unknown,
                 };
                 return Ok(Some(IteratorResult {
-                    name: RawSlice::new(name),
+                    name: RawSlice::new(entry.name),
                     kind: entry_kind,
                 }));
             }
@@ -211,7 +186,6 @@ mod platform {
 #[cfg(target_os = "freebsd")]
 mod platform {
     use super::*;
-    use core::ptr::addr_of;
 
     // The `libc` crate binds neither `getdents` nor `getdirentries` on
     // FreeBSD, so declare the former here.
@@ -221,8 +195,8 @@ mod platform {
         fn getdents(fd: core::ffi::c_int, buf: *mut core::ffi::c_char, nbytes: usize) -> isize;
     }
 
-    /// FreeBSD's `struct dirent` leads with `ino_t` (u64, align 8); a bare
-    /// `[u8; N]` field has alignment 1, so wrap it to force 8-byte alignment.
+    /// 8-byte alignment matches FreeBSD's `struct dirent`. `dirent::parse`
+    /// reads the records as bytes, so no read depends on it.
     #[repr(C, align(8))]
     pub(crate) struct DirentBuf(pub [u8; 8192]);
 
@@ -236,7 +210,9 @@ mod platform {
     impl<const USE_WINDOWS_OSPATH: bool> NewIterator<USE_WINDOWS_OSPATH> {
         pub(crate) fn next(&mut self) -> Result {
             'start_over: loop {
-                if self.index >= self.end_index {
+                // The refill keeps `end_index` inside the buffer.
+                let filled = self.buf.0.get(..self.end_index).unwrap_or(&self.buf.0);
+                if self.index >= filled.len() {
                     // SAFETY: dir is a valid open fd; buf is dirent-aligned scratch.
                     let rc = unsafe {
                         getdents(
@@ -258,30 +234,18 @@ mod platform {
                         return Ok(None);
                     }
                     self.index = 0;
-                    self.end_index = usize::try_from(rc).expect("int cast");
-                }
-                // Records are variable-length; subsequent entries may not be
-                // 8-byte aligned. Never
-                // form a `&dirent` — read each field through the raw pointer.
-                // SAFETY: index < end_index ≤ 8192; kernel wrote a valid record.
-                let entry = unsafe { self.buf.0.as_ptr().add(self.index).cast::<libc::dirent>() };
-                // SAFETY: entry points at a valid (possibly unaligned) dirent.
-                let d_reclen: u16 = unsafe { addr_of!((*entry).d_reclen).read_unaligned() };
-                let d_namlen: u16 = unsafe { addr_of!((*entry).d_namlen).read_unaligned() };
-                let d_fileno: u64 = unsafe { addr_of!((*entry).d_fileno).read_unaligned() };
-                let d_type: u8 = unsafe { addr_of!((*entry).d_type).read_unaligned() };
-                let entry_idx = self.index;
-                self.index += d_reclen as usize;
-
-                // d_name is `d_namlen` bytes at a fixed offset within the record;
-                // slice it directly from `buf` (bounds-checked).
-                let name_off = entry_idx + offset_of!(libc::dirent, d_name);
-                let name = &self.buf.0[name_off..name_off + d_namlen as usize];
-                if name == b"." || name == b".." || d_fileno == 0 {
+                    self.end_index = (rc as usize).min(self.buf.0.len());
                     continue 'start_over;
                 }
+                let Some(record) = dirent::parse::<dirent::Native>(filled, self.index) else {
+                    return Err(dirent::malformed(Tag::getdents64));
+                };
+                self.index = record.next;
+                let Some(entry) = record.entry else {
+                    continue 'start_over;
+                };
 
-                let entry_kind: EntryKind = match d_type {
+                let entry_kind: EntryKind = match entry.d_type {
                     libc::DT_BLK => EntryKind::BlockDevice,
                     libc::DT_CHR => EntryKind::CharacterDevice,
                     libc::DT_DIR => EntryKind::Directory,
@@ -295,7 +259,7 @@ mod platform {
                     _ => EntryKind::Unknown,
                 };
                 return Ok(Some(IteratorResult {
-                    name: RawSlice::new(name),
+                    name: RawSlice::new(entry.name),
                     kind: entry_kind,
                 }));
             }
@@ -310,14 +274,10 @@ mod platform {
 mod platform {
     use super::*;
 
-    /// `dirent64` leads with `d_ino: u64` (align 8); a bare `[u8; N]` field has
-    /// alignment 1, so wrap it to force 8-byte alignment of the buffer base.
-    /// The kernel pads `d_reclen` to a multiple of 8, so every record stays
-    /// 8-aligned as long as the base is.
+    /// 8-byte alignment matches `dirent64`. `dirent::parse` reads the records
+    /// as bytes, so no read depends on it.
     #[repr(C, align(8))]
     pub(crate) struct DirentBuf(pub [u8; 8192]);
-    const _: () =
-        assert!(core::mem::align_of::<DirentBuf>() >= core::mem::align_of::<libc::dirent64>());
 
     pub(crate) struct NewIterator<const USE_WINDOWS_OSPATH: bool> {
         pub(crate) dir: Fd,
@@ -331,7 +291,9 @@ mod platform {
         /// with subsequent calls to `next`, as well as when this `Dir` is deinitialized.
         pub(crate) fn next(&mut self) -> Result {
             'start_over: loop {
-                if self.index >= self.end_index {
+                // The refill keeps `end_index` inside the buffer.
+                let filled = self.buf.0.get(..self.end_index).unwrap_or(&self.buf.0);
+                if self.index >= filled.len() {
                     // glibc doesn't expose getdents64; go straight to the
                     // raw syscall.
                     // SAFETY: buf is valid for 8192 bytes; fd is a plain c_int.
@@ -353,40 +315,18 @@ mod platform {
                         return Ok(None);
                     }
                     self.index = 0;
-                    self.end_index = rc as usize;
-                }
-                // Records are variable-length; `libc::dirent64` declares
-                // `d_name: [c_char; 256]` but the kernel only writes up to
-                // `d_reclen` bytes, so forming a `&dirent64` could span past
-                // the filled region (or past `buf` near the end). Never form a
-                // reference — read each field through the raw pointer.
-                // SAFETY: index < end_index ≤ 8192; kernel wrote a valid
-                // record header at this offset. `DirentBuf` is align(8) and
-                // d_reclen is always a multiple of 8, so `entry` is 8-aligned.
-                let entry = unsafe { self.buf.0.as_ptr().add(self.index).cast::<libc::dirent64>() };
-                debug_assert!(entry.is_aligned());
-                // SAFETY: entry points at a valid record header within buf.
-                let d_reclen: u16 = unsafe { core::ptr::addr_of!((*entry).d_reclen).read() };
-                // SAFETY: see above.
-                let d_type: u8 = unsafe { core::ptr::addr_of!((*entry).d_type).read() };
-                let entry_idx = self.index;
-                let next_index = entry_idx + d_reclen as usize;
-                self.index = next_index;
-
-                // dirent64.d_name is NUL-terminated within [name_off, next_index);
-                // slice it directly from `buf` (bounds-checked) and scan for NUL
-                // instead of dereferencing the raw `*const dirent64`.
-                let name_off = entry_idx + offset_of!(libc::dirent64, d_name);
-                let region = &self.buf.0[name_off..next_index];
-                let nul = bun_core::strings::index_of_char_usize(region, 0).unwrap_or(region.len());
-                let name = &region[..nul];
-
-                // skip . and .. entries
-                if name == b"." || name == b".." {
+                    self.end_index = (rc as usize).min(self.buf.0.len());
                     continue 'start_over;
                 }
+                let Some(record) = dirent::parse::<dirent::Native>(filled, self.index) else {
+                    return Err(dirent::malformed(Tag::getdents64));
+                };
+                self.index = record.next;
+                let Some(entry) = record.entry else {
+                    continue 'start_over;
+                };
 
-                let entry_kind: EntryKind = match d_type {
+                let entry_kind: EntryKind = match entry.d_type {
                     libc::DT_BLK => EntryKind::BlockDevice,
                     libc::DT_CHR => EntryKind::CharacterDevice,
                     libc::DT_DIR => EntryKind::Directory,
@@ -400,7 +340,7 @@ mod platform {
                     _ => EntryKind::Unknown,
                 };
                 return Ok(Some(IteratorResult {
-                    name: RawSlice::new(name),
+                    name: RawSlice::new(entry.name),
                     kind: entry_kind,
                 }));
             }
