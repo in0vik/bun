@@ -250,35 +250,51 @@ function listed(mode: string, names: string[]): Record<string, unknown> {
 
 // One form for each walker: node:fs, then the one in bun_sys.
 const eachWalker = ["readdirSync", "globSync"];
-// The forms that read the directory with one walk of one iterator.
-const plainForms = [...eachWalker, "readdirSyncWithFileTypes", "readdirCallback", "readdir", "opendirSync", "glob"];
+const syncForms = [...eachWalker, "readdirSyncWithFileTypes", "opendirSync"];
+const asyncForms = ["readdirCallback", "readdir", "glob"];
 // macOS can copy or remove a tree without a walk of it, so what these report
 // there is not known.
 const treeForms = ["readdirSyncRecursive", "readdirRecursive", "rmSync", "cpSync"];
-const everyForm = isMacOS ? plainForms : [...plainForms, ...treeForms];
 
-// Records that the shim touches and that are still well formed. They run
-// first, so that they are judged even when a later mode ends the process.
-const wellFormed: [string, string[]][] = [
-  ["intact", everyForm],
-  ["inode-zero", eachWalker],
-];
-const damaged: [string, string[]][] = [
-  // The record from the crash report.
-  ["reclen-zero", everyForm],
-  ["reclen-below-header", eachWalker],
-  ["reclen-past-end", eachWalker],
-  ["second-record", eachWalker],
-  ["all-zeros", eachWalker],
-  ["name-unterminated", eachWalker],
-  ["name-empty", eachWalker],
-  ["header-cut", eachWalker],
-  ["count-above-buffer", eachWalker],
-];
 // macOS keeps a removed entry in place with inode 0. The walkers skip it and
 // read nothing of it but its length. Linux has no such rule.
-const inodeZeroWithBadName: [string, string[]] = ["inode-zero-name-unterminated", eachWalker];
-const plan = [...wellFormed, ...(isMacOS ? [inodeZeroWithBadName, ...damaged] : [...damaged, inodeZeroWithBadName])];
+const inodeZeroWithBadName = "inode-zero-name-unterminated";
+
+// Each plan is one process, and all of them run at the same time. A debug
+// build starts slowly: one process for every case does not fit the default
+// timeout on a busy machine, and neither does a process for each case.
+//
+// In a plan, the directories whose records are well formed come first, so
+// that they are judged even when a later one ends the process.
+type Plan = [mode: string, forms: string[]][];
+const plans: Record<string, Plan> = {
+  sync: [
+    ["intact", syncForms],
+    ["inode-zero", eachWalker],
+    // The record from the crash report.
+    ["reclen-zero", syncForms],
+    [inodeZeroWithBadName, eachWalker],
+  ],
+  async: [
+    ["intact", asyncForms],
+    ["reclen-zero", asyncForms],
+  ],
+  tree: [
+    ["intact", treeForms],
+    ["reclen-zero", treeForms],
+  ],
+  damaged: [
+    ["reclen-below-header", eachWalker],
+    ["reclen-past-end", eachWalker],
+    ["second-record", eachWalker],
+    ["all-zeros", eachWalker],
+    ["name-unterminated", eachWalker],
+    ["name-empty", eachWalker],
+    ["header-cut", eachWalker],
+    ["count-above-buffer", eachWalker],
+  ],
+};
+if (isMacOS) delete plans.tree;
 
 function only(forms: string[], expected: Record<string, unknown>) {
   return Object.fromEntries(forms.map(form => [form, expected[form]]));
@@ -286,11 +302,11 @@ function only(forms: string[], expected: Record<string, unknown>) {
 
 describe.skipIf(!(isGlibc || isMacOS) || !cc)("a malformed directory record", () => {
   let dir: ReturnType<typeof tempDir>;
-  let walked: Promise<{ results: Record<string, unknown>; stderr: string; exitCode: number }>;
+  const walked: Record<string, Promise<{ results: Record<string, unknown>; stderr: string; exitCode: number }>> = {};
 
   beforeAll(async () => {
     const tree: Record<string, string> = { "shim.c": SHIM_C, "fixture.js": FIXTURE };
-    for (const [mode] of plan) {
+    for (const [mode] of Object.values(plans).flat()) {
       for (const file of files) {
         tree[`read/${mode}/${file}`] = "";
         tree[`nested-${mode}/${mode}/${file}`] = "";
@@ -310,16 +326,14 @@ describe.skipIf(!(isGlibc || isMacOS) || !cc)("a malformed directory record", ()
     });
     const [out, err, exitCode] = await Promise.all([compile.stdout.text(), compile.stderr.text(), compile.exited]);
     if (exitCode !== 0) throw new Error(`Failed to build the shim:\n${err || out}`);
-    walked = walk(shimPath);
+    for (const [name, plan] of Object.entries(plans)) walked[name] = walk(shimPath, plan);
   });
 
   afterAll(() => {
     dir?.[Symbol.dispose]();
   });
 
-  // One process walks every mode. A debug build starts slowly, and a process
-  // for each mode does not fit the default timeout.
-  async function walk(shimPath: string) {
+  async function walk(shimPath: string, plan: Plan) {
     const preload = isMacOS ? "DYLD_INSERT_LIBRARIES" : "LD_PRELOAD";
     const existing = bunEnv[preload];
     await using proc = Bun.spawn({
@@ -342,28 +356,59 @@ describe.skipIf(!(isGlibc || isMacOS) || !cc)("a malformed directory record", ()
   }
 
   // One value so that a crash shows stderr and the exit code in the diff.
-  async function outcome(mode: string) {
-    const { results, stderr, exitCode } = await walked;
+  async function outcome(plan: string, mode: string) {
+    const { results, stderr, exitCode } = await walked[plan];
     return { result: results[mode], stderr, exitCode };
   }
 
-  test.each(damaged)("%s is an EIO error", async (mode, forms) => {
-    expect(await outcome(mode)).toEqual({ result: only(forms, malformed(mode)), stderr: "", exitCode: 0 });
+  test.each(plans.damaged)("%s is an EIO error", async (mode, forms) => {
+    expect(await outcome("damaged", mode)).toEqual({
+      result: only(forms, malformed(mode)),
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  describe("d_reclen 0 is an EIO error", () => {
+    test.each([
+      ["sync", syncForms],
+      ["async", asyncForms],
+    ])("in the %s forms that read one directory", async (plan, forms) => {
+      expect(await outcome(plan, "reclen-zero")).toEqual({
+        result: only(forms, malformed("reclen-zero")),
+        stderr: "",
+        exitCode: 0,
+      });
+    });
+
+    test.skipIf(isMacOS)("in the forms that walk a tree", async () => {
+      expect(await outcome("tree", "reclen-zero")).toEqual({
+        result: only(treeForms, malformed("reclen-zero")),
+        stderr: "",
+        exitCode: 0,
+      });
+    });
   });
 
   // The shim is loaded and leaves this directory alone.
   test("an intact directory is listed", async () => {
-    expect((await outcome("intact")).result).toEqual(only(everyForm, listed("intact", files)));
+    const listing = listed("intact", files);
+    const intact = async (plan: string) => plan in plans && (await outcome(plan, "intact")).result;
+    expect({ sync: await intact("sync"), async: await intact("async"), tree: await intact("tree") }).toEqual({
+      sync: only(syncForms, listing),
+      async: only(asyncForms, listing),
+      tree: !isMacOS && only(treeForms, listing),
+    });
   });
 
   test("an entry with inode 0 is skipped on macOS and listed on Linux", async () => {
     const names = isMacOS ? ["a.txt", "c.txt"] : files;
-    expect((await outcome("inode-zero")).result).toEqual(only(eachWalker, listed("inode-zero", names)));
+    expect((await outcome("sync", "inode-zero")).result).toEqual(only(eachWalker, listed("inode-zero", names)));
   });
 
   test("the name of an entry with inode 0 is read on Linux and not on macOS", async () => {
-    const [mode, forms] = inodeZeroWithBadName;
+    const mode = inodeZeroWithBadName;
     const expected = isMacOS ? listed(mode, ["a.txt", "c.txt"]) : malformed(mode);
-    expect(await outcome(mode)).toEqual({ result: only(forms, expected), stderr: "", exitCode: 0 });
+    expect(await outcome("sync", mode)).toEqual({ result: only(eachWalker, expected), stderr: "", exitCode: 0 });
   });
 });
