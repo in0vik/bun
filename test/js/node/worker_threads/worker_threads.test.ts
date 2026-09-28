@@ -715,6 +715,30 @@ describe("error event", () => {
     expect(err).toBeInstanceOf(Error);
     expect(err.message).toMatch(/MessagePort \[EventTarget\] \{.*\}/s);
   });
+
+  // The worker renders its uncaught error to text before it reports the error.
+  // The render of each cause must not render the rest of the chain twice.
+  test("is fired for an error with a chain of 30 assigned causes", async () => {
+    using dir = tempDir("worker-error-cause-chain", {
+      "parent.cjs": `
+        const { Worker } = require("node:worker_threads");
+        const worker = new Worker(
+          'let e = new Error("leaf"); for (let i = 0; i < 30; i++) { const x = new Error("l" + i); x.cause = e; e = x; } throw e;',
+          { eval: true },
+        );
+        worker.on("error", error => console.log(error.name + ": " + error.message));
+      `,
+    });
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "parent.cjs"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, , exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, exitCode }).toEqual({ stdout: "Error: l29\n", exitCode: 0 });
+  });
 });
 
 describe("getHeapSnapshot", () => {
