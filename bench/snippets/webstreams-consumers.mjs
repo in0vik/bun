@@ -45,12 +45,34 @@ const mixed = size => {
   };
 };
 
+// A direct stream that writes strings: TOTAL code units, then `last`.
+const direct = (size, unit, last) => {
+  const chunk = unit.repeat(size);
+  const count = TOTAL / size;
+  return () =>
+    new ReadableStream({
+      type: "direct",
+      pull(c) {
+        for (let i = 0; i < count; i++) c.write(chunk);
+        if (last) c.write(last);
+        c.end();
+      },
+    });
+};
+
 const shapes = {
   "binary 64KiB x128": binary(64 * 1024),
   "binary 1KiB x8192": binary(1024),
   "text 64KiB x128": text(64 * 1024),
   "text 1KiB x8192": text(1024),
   "mixed text/bytes 64KiB x128": mixed(64 * 1024),
+  "direct text 64KiB x128": direct(64 * 1024, "x"),
+  "direct text 1KiB x8192": direct(1024, "x"),
+  "direct text 16B x524288": direct(16, "x"),
+  "direct UTF-16 64KiB x128": direct(64 * 1024, "\u4F60"),
+  "direct UTF-16 1KiB x8192": direct(1024, "\u4F60"),
+  "direct UTF-16 16B x524288": direct(16, "\u4F60"),
+  "direct text, UTF-16 last": direct(1024, "x", "\u4F60"),
   "one 8MiB chunk": (() => {
     const chunk = new Uint8Array(TOTAL).fill(122);
     return () =>
