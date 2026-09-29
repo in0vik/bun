@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe } from "harness";
+import { bunEnv, bunExe, isASAN, isDebug } from "harness";
 import { totalmem } from "node:os";
 
 // Consuming a stream as text must reject with a catchable error when the accumulated
@@ -21,10 +21,13 @@ function consumeToText(streamSource: string): string {
   `;
 }
 
-async function run(script: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+async function run(
+  script: string,
+  env: Record<string, string | undefined> = bunEnv,
+): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   await using proc = Bun.spawn({
     cmd: [bunExe(), "-e", script],
-    env: bunEnv,
+    env,
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -200,4 +203,268 @@ test.skipIf(!enoughMemory)("TextDecoderStream rejects a chunk too long to join w
     }
   `);
   expect(result).toEqual(threw);
+});
+
+// The text sink of a direct stream, and the text consumers of every other stream, join string
+// chunks in one WTF::StringBuilder. A string that the builder cannot take has to be an error
+// that script can catch, and the builder has to keep the text it has: the caller of write()
+// can catch the error and end the stream. The builder lost its text, and the next read of it
+// aborted the process.
+const settle = `
+  const describeError = e => e.name + ": " + e.message;
+  // "aaabbc" is "a3 b2 c1".
+  const runs = text => text.replace(/(.)\\1*/gs, (run, character) => character + run.length + " ").trim();
+  const settle = promise => promise.then(text => ({ text: runs(text) }), e => ({ rejected: describeError(e) }));
+`;
+
+// The builder cannot grow because an allocation fails. With Malloc=1 WebKit allocates through
+// the system allocator, so ASAN's cap of 4 MiB for one allocation covers the builder's buffer.
+// ASAN logs every allocation that it refuses to stderr.
+describe.skipIf(!isASAN)("text consumers keep their text when a string chunk cannot be allocated", () => {
+  const MIB = 1024 * 1024;
+  const env = {
+    ...bunEnv,
+    Malloc: "1",
+    ASAN_OPTIONS: [bunEnv.ASAN_OPTIONS, "allocator_may_return_null=1", "max_allocation_size_mb=4", "detect_leaks=0"]
+      .filter(Boolean)
+      .join(":"),
+  };
+  const outOfMemory = "RangeError: Out of memory";
+  const prelude = `
+    ${settle}
+    const megabyte = letter => Buffer.alloc(${MIB}, letter).toString("latin1");
+    // Three megabytes fit in one allocation. Four megabytes and the header of the string do not.
+    const writeUntilRefused = controller => {
+      let written = 0;
+      try {
+        for (; written < 8; written++) controller.write(megabyte("abcdefgh"[written]));
+      } catch (e) {
+        return { written, refused: describeError(e) };
+      }
+      return { written, refused: null };
+    };
+  `;
+  const runWithCap = async (source: string) => {
+    const { stdout, exitCode } = await run(`${prelude}\n${source}`, env);
+    return { stdout: JSON.parse(stdout || "null"), exitCode };
+  };
+  const threeMegabytes = `a${MIB} b${MIB} c${MIB}`;
+
+  test.concurrent("direct stream: the caller catches the error and ends the stream", async () => {
+    const result = await runWithCap(`
+      let writes;
+      const stream = new ReadableStream({
+        type: "direct",
+        pull(controller) {
+          writes = writeUntilRefused(controller);
+          controller.end();
+        },
+      });
+      console.log(JSON.stringify({ ...(await settle(Bun.readableStreamToText(stream))), ...writes }));
+    `);
+    expect(result).toEqual({ stdout: { text: threeMegabytes, written: 3, refused: outOfMemory }, exitCode: 0 });
+  });
+
+  test.concurrent("direct stream: the caller catches the error and writes bytes", async () => {
+    const result = await runWithCap(`
+      let writes;
+      const stream = new ReadableStream({
+        type: "direct",
+        pull(controller) {
+          writes = writeUntilRefused(controller);
+          controller.write(new TextEncoder().encode("z"));
+          controller.end();
+        },
+      });
+      console.log(JSON.stringify({ ...(await settle(Bun.readableStreamToText(stream))), ...writes }));
+    `);
+    expect(result).toEqual({
+      stdout: { text: `${threeMegabytes} z1`, written: 3, refused: outOfMemory },
+      exitCode: 0,
+    });
+  });
+
+  test.concurrent("direct stream: nothing catches the error", async () => {
+    const result = await runWithCap(`
+      let written = 0;
+      const stream = new ReadableStream({
+        type: "direct",
+        pull(controller) {
+          for (; written < 8; written++) controller.write(megabyte("abcdefgh"[written]));
+          controller.end();
+        },
+      });
+      console.log(JSON.stringify({ ...(await settle(Bun.readableStreamToText(stream))), written }));
+    `);
+    expect(result).toEqual({ stdout: { rejected: outOfMemory, written: 3 }, exitCode: 0 });
+  });
+
+  test.concurrent("mixed chunks: three megabytes of strings after bytes", async () => {
+    const result = await runWithCap(`
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("z"));
+          for (const letter of "abc") controller.enqueue(megabyte(letter));
+          controller.close();
+        },
+      });
+      console.log(JSON.stringify(await settle(Bun.readableStreamToText(stream))));
+    `);
+    expect(result).toEqual({ stdout: { text: `z1 ${threeMegabytes}` }, exitCode: 0 });
+  });
+
+  test.concurrent("mixed chunks: four megabytes of strings after bytes", async () => {
+    const result = await runWithCap(`
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("z"));
+          for (const letter of "abcd") controller.enqueue(megabyte(letter));
+          controller.close();
+        },
+      });
+      console.log(JSON.stringify(await settle(Bun.readableStreamToText(stream))));
+    `);
+    expect(result).toEqual({ stdout: { rejected: outOfMemory }, exitCode: 0 });
+  });
+
+  // The builder is 8-bit until the 16-bit chunk comes, and then needs a buffer of 2 bytes for each character.
+  test.concurrent("string chunks: one megabyte, then a 16-bit character", async () => {
+    const result = await runWithCap(`
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(megabyte("a"));
+          controller.enqueue("\\u20AC");
+          controller.close();
+        },
+      });
+      console.log(JSON.stringify(await settle(Bun.readableStreamToText(stream))));
+    `);
+    expect(result).toEqual({ stdout: { text: `a${MIB} \u20AC1` }, exitCode: 0 });
+  });
+
+  test.concurrent("string chunks: three megabytes, then a 16-bit character", async () => {
+    const result = await runWithCap(`
+      const stream = new ReadableStream({
+        start(controller) {
+          for (const letter of "abc") controller.enqueue(megabyte(letter));
+          controller.enqueue("\\u20AC");
+          controller.close();
+        },
+      });
+      console.log(JSON.stringify(await settle(Bun.readableStreamToText(stream))));
+    `);
+    expect(result).toEqual({ stdout: { rejected: outOfMemory }, exitCode: 0 });
+  });
+});
+
+// The builder cannot grow because the text would be longer than a string can be.
+describe.skipIf(!enoughMemory)("text consumers keep their text when a string chunk passes the string limit", () => {
+  const outOfMemory = "RangeError: Out of memory";
+  const prelude = `
+    const describeError = e => e.name + ": " + e.message;
+    const gigabyte = Buffer.alloc(2 ** 30, "x").toString("latin1");
+    const settle = promise =>
+      promise.then(
+        text => ({ length: text.length, isTheFirstChunk: text === gigabyte }),
+        e => ({ rejected: describeError(e) }),
+      );
+  `;
+  const runParsed = async (source: string) => {
+    const { stdout, stderr, exitCode } = await run(`${prelude}\n${source}`);
+    return { stdout: JSON.parse(stdout || "null"), stderr, exitCode };
+  };
+
+  test("direct stream: the caller catches the error and ends the stream", async () => {
+    const result = await runParsed(`
+      let refused = null;
+      const stream = new ReadableStream({
+        type: "direct",
+        pull(controller) {
+          controller.write(gigabyte);
+          try {
+            controller.write(gigabyte);
+          } catch (e) {
+            refused = describeError(e);
+          }
+          controller.end();
+        },
+      });
+      console.log(JSON.stringify({ ...(await settle(Bun.readableStreamToText(stream))), refused }));
+    `);
+    expect(result).toEqual({
+      stdout: { length: 2 ** 30, isTheFirstChunk: true, refused: outOfMemory },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  test("direct stream: nothing catches the error", async () => {
+    const result = await runParsed(`
+      let wroteTwice = false;
+      const stream = new ReadableStream({
+        type: "direct",
+        pull(controller) {
+          controller.write(gigabyte);
+          controller.write(gigabyte);
+          wroteTwice = true;
+          controller.end();
+        },
+      });
+      console.log(JSON.stringify({ ...(await settle(new Response(stream).text())), wroteTwice }));
+    `);
+    expect(result).toEqual({ stdout: { rejected: outOfMemory, wroteTwice: false }, stderr: "", exitCode: 0 });
+  });
+
+  // A gigabyte of Latin-1 and one 16-bit character fit in a string of 16-bit characters. The
+  // builder asked for twice its size to make room, which no 16-bit string can have, and
+  // overflowed. The child holds 4 to 5 GiB, and 6.5 GiB in a build with ASAN.
+  describe.skipIf(isASAN || isDebug || totalmem() < 16 * 1024 ** 3)("a 16-bit character after a gigabyte", () => {
+    const settled = { length: 2 ** 30 + 1, startsWithTheFirstChunk: true, last: "\u20AC" };
+    const consume = `
+      const text = await Bun.readableStreamToText(stream);
+      console.log(
+        JSON.stringify({
+          length: text.length,
+          startsWithTheFirstChunk: text.startsWith(gigabyte),
+          last: text.at(-1),
+          refused,
+        }),
+      );
+    `;
+
+    test("direct stream", async () => {
+      const result = await runParsed(`
+        let refused = null;
+        const stream = new ReadableStream({
+          type: "direct",
+          pull(controller) {
+            controller.write(gigabyte);
+            try {
+              controller.write("\\u20AC");
+            } catch (e) {
+              refused = describeError(e);
+            }
+            controller.end();
+          },
+        });
+        ${consume}
+      `);
+      expect(result).toEqual({ stdout: { ...settled, refused: null }, stderr: "", exitCode: 0 });
+    });
+
+    test("string chunks of another stream", async () => {
+      const result = await runParsed(`
+        const refused = null;
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(gigabyte);
+            controller.enqueue("\\u20AC");
+            controller.close();
+          },
+        });
+        ${consume}
+      `);
+      expect(result).toEqual({ stdout: { ...settled, refused: null }, stderr: "", exitCode: 0 });
+    });
+  });
 });

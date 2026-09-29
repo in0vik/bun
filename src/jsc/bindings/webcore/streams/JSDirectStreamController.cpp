@@ -484,10 +484,6 @@ static String finishTextSink(JSC::VM& vm, JSGlobalObject* globalObject, JSDirect
     auto scope = DECLARE_THROW_SCOPE(vm);
     // Pure-string rope: the ONLY arm of the direct Text sink that strips a leading BOM.
     if (hasString && !hasBuffer) {
-        if (Bun::WebStreams::exceedsStringLimit(accumulator.ropeLength())) [[unlikely]] {
-            throwOutOfMemoryError(globalObject, scope);
-            return String();
-        }
         String rope = accumulator.ropeString();
         if (rope.length() && rope[0] == 0xFEFF)
             return rope.substring(1);

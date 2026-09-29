@@ -605,17 +605,17 @@ static JSValue convertChunksToText(JSGlobalObject* globalObject, JSValue chunksV
             return {};
         }
         WTF::StringBuilder rope;
-        rope.reserveCapacity(codeUnits.value());
-        for (unsigned i = 0; i < length; i++) {
+        bool appended = rope.tryReserveCapacity(codeUnits.value());
+        for (unsigned i = 0; appended && i < length; i++) {
             WTF::String string = asString(values.at(i))->value(globalObject);
             RETURN_IF_EXCEPTION(scope, {});
-            rope.append(string);
+            appended = rope.tryAppend(string);
         }
-        if (rope.hasOverflowed()) [[unlikely]] {
+        if (!appended) [[unlikely]] {
             throwOutOfMemoryError(globalObject, scope);
             return {};
         }
-        RELEASE_AND_RETURN(scope, jsString(vm, stripTextResultBOM(rope.toString())));
+        RELEASE_AND_RETURN(scope, jsString(vm, stripTextResultBOM(rope.tryToString())));
     }
 
     // Mixed string/binary chunks: drive the shared accumulator so adjacent-string rope
@@ -717,11 +717,6 @@ static WTF::String finishTextAccumulator(JSC::VM& vm, JSGlobalObject* globalObje
     if (!hasString && !hasBuffer)
         return WTF::emptyString();
     if (hasString && !hasBuffer) {
-        if (exceedsStringLimit(accumulator.ropeLength())) [[unlikely]] {
-            releaseAccumulated();
-            throwOutOfMemoryError(globalObject, scope);
-            return WTF::String();
-        }
         WTF::String rope = accumulator.ropeString();
         releaseAccumulated();
         if (rope.length() && rope[0] == 0xFEFF)

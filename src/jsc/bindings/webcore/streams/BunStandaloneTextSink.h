@@ -11,6 +11,7 @@
 #include "root.h"
 #include "StreamsForward.h"
 #include "VectorSizeLimit.h"
+#include "WebStreamsInternals.h"
 
 #include <JavaScriptCore/HeapAnalyzer.h>
 #include <JavaScriptCore/JSDestructibleObject.h>
@@ -36,11 +37,11 @@ struct BunTextAccumulator {
     bool hasString { false };
     bool hasBuffer { false };
 
-    // Appends a string chunk to the rope. On false the rope did not take it and the caller throws.
+    // Appends a string chunk to the rope, which is never longer than a string can be.
+    // On false the rope holds what it held, and the caller throws.
     ALWAYS_INLINE bool tryAppendString(const WTF::String& chunk)
     {
-        m_rope.append(chunk);
-        if (m_rope.hasOverflowed()) [[unlikely]]
+        if (exceedsStringLimit(static_cast<size_t>(m_rope.length()) + chunk.length()) || !m_rope.tryAppend(chunk)) [[unlikely]]
             return false;
         hasString = true;
         estimatedLength += chunk.length();
@@ -49,8 +50,12 @@ struct BunTextAccumulator {
 
     // The rope holds the string chunks that came after the last binary chunk.
     bool hasRope() const { return !m_rope.isEmpty(); }
-    unsigned ropeLength() const { return m_rope.length(); }
-    WTF::String ropeString() { return m_rope.toString(); }
+    WTF::String ropeString()
+    {
+        WTF::String string = m_rope.tryToString();
+        ASSERT(!string.isNull());
+        return string;
+    }
 
     // Script adds a piece per write(), so growth is fallible. On false the caller throws after it drops the lock.
     bool tryAppendPieces(const WTF::AbstractLocker&, JSC::VM& vm, JSC::JSCell* owner, JSC::JSString* flushedRope, JSC::JSValue chunk)
@@ -99,10 +104,9 @@ struct BunTextAccumulator {
     }
 
 private:
-    // the pure-string fast-path rope. RecordOverflow: an append past
-    // StringImpl::MaxLength must surface as a catchable out-of-memory error at the
-    // write site, never as the default policy's process abort.
-    WTF::StringBuilder m_rope { WTF::OverflowPolicy::RecordOverflow };
+    // the pure-string fast-path rope. It takes text through tryAppend only, so it never
+    // overflows: a chunk that does not fit is refused and the rope keeps its text.
+    WTF::StringBuilder m_rope;
 };
 
 } // namespace WebStreams
